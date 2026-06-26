@@ -534,6 +534,10 @@ Examples:
     profile_create_parser = profile_subparsers.add_parser("create", help="Create a profile interactively")
     profile_create_parser.add_argument("profile_name", help="Name of the new profile")
 
+    profile_dup_parser = profile_subparsers.add_parser("duplicate", help="Duplicate a saved profile")
+    profile_dup_parser.add_argument("source_profile", help="Name of the profile to duplicate")
+    profile_dup_parser.add_argument("target_profile", help="Name of the new profile copy")
+
     # list-images command
     list_images_parser = subparsers.add_parser("list-images", help="List available official Raspberry Pi OS images")
 
@@ -588,6 +592,14 @@ def handle_profile_command(args):
     elif args.profile_action == "create":
         config = run_configuration_wizard()
         save_profile(args.profile_name, config)
+    elif args.profile_action == "duplicate":
+        try:
+            config = load_profile(args.source_profile)
+            save_profile(args.target_profile, config)
+        except FileNotFoundError as e:
+            print_error(str(e))
+        except Exception as e:
+            print_error(f"Failed to duplicate profile: {e}")
 
 def handle_list_images():
     catalog = fetch_official_os_list()
