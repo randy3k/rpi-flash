@@ -1,0 +1,915 @@
+#!/usr/bin/env python3
+import os
+import sys
+import shutil
+import tempfile
+import subprocess
+import json
+import urllib.request
+import glob
+import getpass
+import argparse
+import time
+import hashlib
+
+# --- Color Scheme for Premium CLI Experience ---
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+def print_header(title):
+    print(f"\n{Colors.BOLD}{Colors.HEADER}=== {title} ==={Colors.ENDC}")
+
+def print_success(message):
+    print(f"{Colors.GREEN}✔ {message}{Colors.ENDC}")
+
+def print_warning(message):
+    print(f"{Colors.WARNING}⚠ WARNING: {message}{Colors.ENDC}")
+
+def print_error(message):
+    print(f"{Colors.FAIL}✘ ERROR: {message}{Colors.ENDC}")
+
+# --- Helper Functions for Interactive Prompts ---
+def prompt_choice(question, options, default=1):
+    print(f"\n{Colors.BOLD}{Colors.CYAN}? {question}{Colors.ENDC}")
+    for idx, opt in enumerate(options, 1):
+        def_str = f" (default)" if idx == default else ""
+        print(f"  {Colors.GREEN}{idx}){Colors.ENDC} {opt}{def_str}")
+    
+    while True:
+        try:
+            choice = input(f"Select (1-{len(options)}) [{default}]: ").strip()
+            if not choice:
+                return default
+            val = int(choice)
+            if 1 <= val <= len(options):
+                return val
+            print(f"{Colors.FAIL}Please enter a number between 1 and {len(options)}.{Colors.ENDC}")
+        except ValueError:
+            print(f"{Colors.FAIL}Invalid input. Please enter a number.{Colors.ENDC}")
+
+def prompt_yes_no(question, default=True):
+    def_str = " [Y/n]" if default else " [y/N]"
+    print(f"{Colors.BOLD}{Colors.CYAN}? {question}{def_str}{Colors.ENDC}", end=" ")
+    while True:
+        choice = input().strip().lower()
+        if not choice:
+            return default
+        if choice in ['y', 'yes']:
+            return True
+        if choice in ['n', 'no']:
+            return False
+        print(f"{Colors.FAIL}Please enter y or n.{Colors.ENDC} ", end="")
+
+def prompt_text(question, default=""):
+    def_str = f" [{default}]" if default else ""
+    print(f"{Colors.BOLD}{Colors.CYAN}? {question}{def_str}:{Colors.ENDC}", end=" ")
+    val = input().strip()
+    return val if val else default
+
+def prompt_password(question, confirm=True):
+    while True:
+        p1 = getpass.getpass(f"{Colors.BOLD}{Colors.CYAN}? {question}:{Colors.ENDC} ")
+        if not p1:
+            print(f"{Colors.FAIL}Password cannot be empty.{Colors.ENDC}")
+            continue
+        if not confirm:
+            return p1
+        p2 = getpass.getpass(f"{Colors.BOLD}{Colors.CYAN}? Confirm password:{Colors.ENDC} ")
+        if p1 == p2:
+            return p1
+        print(f"{Colors.FAIL}Passwords do not match. Try again.{Colors.ENDC}")
+
+# --- Core Logic Functions ---
+
+def get_removable_disks():
+    """Queries connected block devices using lsblk."""
+    try:
+        res = subprocess.run(["lsblk", "-o", "NAME,FSTYPE,LABEL,SIZE,MOUNTPOINT,MODEL,TRAN,RM", "-J"], capture_output=True, text=True, check=True)
+        data = json.loads(res.stdout)
+    except Exception as e:
+        print_warning(f"Failed to query block devices using lsblk JSON: {e}")
+        return []
+        
+    devices = []
+    for dev in data.get("blockdevices", []):
+        is_removable = dev.get("rm") or dev.get("tran") == "usb"
+        
+        mounts = []
+        if dev.get("mountpoint"):
+            mounts.append(dev["mountpoint"])
+        
+        has_root_mount = dev.get("mountpoint") == "/"
+        
+        children = dev.get("children", [])
+        for child in children:
+            if child.get("mountpoint"):
+                mounts.append(child["mountpoint"])
+                if child.get("mountpoint") == "/":
+                    has_root_mount = True
+                    
+        if has_root_mount:
+            continue
+            
+        devices.append({
+            "name": dev.get("name"),
+            "model": dev.get("model") or "Unknown Model",
+            "size": dev.get("size"),
+            "tran": dev.get("tran") or "N/A",
+            "removable": is_removable,
+            "mounts": mounts,
+            "path": f"/dev/{dev.get('name')}"
+        })
+    return devices
+
+def hash_password(password):
+    """Securely hashes a plaintext password using openssl passwd -6."""
+    try:
+        proc = subprocess.run(
+            ["openssl", "passwd", "-6", "--stdin"],
+            input=password,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return proc.stdout.strip()
+    except Exception as e:
+        raise RuntimeError("Failed to generate password hash using OpenSSL. Please ensure openssl is installed.") from e
+
+def get_local_ssh_keys():
+    """Finds SSH public keys in ~/.ssh/."""
+    home = os.path.expanduser("~")
+    pub_files = glob.glob(os.path.join(home, ".ssh", "*.pub"))
+    keys = []
+    for filepath in pub_files:
+        try:
+            with open(filepath, "r") as f:
+                content = f.read().strip()
+                if content:
+                    keys.append((os.path.basename(filepath), content))
+        except Exception:
+            pass
+    return keys
+
+def get_github_ssh_keys(username):
+    """Fetches public keys from GitHub."""
+    url = f"https://github.com/{username}.keys"
+    try:
+        req = urllib.request.Request(
+            url, 
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req) as response:
+            content = response.read().decode().strip()
+            if response.status == 200 and content:
+                return [line.strip() for line in content.splitlines() if line.strip()]
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch keys for GitHub user '{username}': {e}")
+    return []
+
+# --- Official Image Management ---
+
+OFFICIAL_OS_LIST_URL = "https://downloads.raspberrypi.org/os_list_imagingutility_v4.json"
+
+def get_cached_os_list_path():
+    home = os.path.expanduser("~")
+    cache_dir = os.path.join(home, ".cache", "rpi-flash")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, "os_list.json")
+
+def fetch_official_os_list(force=False):
+    """Downloads or reads cached OS list JSON."""
+    cache_path = get_cached_os_list_path()
+    # Cache for 24 hours
+    if not force and os.path.exists(cache_path) and (time.time() - os.path.getmtime(cache_path) < 86400):
+        try:
+            with open(cache_path, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+            
+    print(f"{Colors.BLUE}Fetching official Raspberry Pi OS catalog...{Colors.ENDC}")
+    try:
+        req = urllib.request.Request(
+            OFFICIAL_OS_LIST_URL,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode())
+            with open(cache_path, "w") as f:
+                json.dump(data, f)
+            return data
+    except Exception as e:
+        print_warning(f"Could not fetch online OS catalog: {e}. Using local cache if available.")
+        if os.path.exists(cache_path):
+            with open(cache_path, "r") as f:
+                return json.load(f)
+        else:
+            raise RuntimeError("OS catalog is unavailable and no local cache exists.")
+
+def flatten_os_list(os_list, category=""):
+    flat_list = []
+    for item in os_list:
+        name = item.get("name")
+        full_name = f"{category} > {name}" if category else name
+        if "subitems" in item:
+            flat_list.extend(flatten_os_list(item["subitems"], category=full_name))
+        elif "url" in item:
+            flat_list.append({
+                "name": name,
+                "full_category": category,
+                "description": item.get("description", ""),
+                "url": item.get("url"),
+                "extract_size": item.get("extract_size"),
+                "extract_sha256": item.get("extract_sha256"),
+                "image_download_size": item.get("image_download_size"),
+                "devices": item.get("devices", [])
+            })
+    return flat_list
+
+def download_file(url, dest_path, expected_size=None):
+    """Downloads a file showing progress."""
+    print(f"{Colors.BLUE}Downloading: {url}{Colors.ENDC}")
+    print(f"Destination: {dest_path}")
+    
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    block_size = 1024 * 1024
+    start_time = time.time()
+    
+    try:
+        req = urllib.request.Request(
+            url, 
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req) as response:
+            total_size = response.info().get("Content-Length")
+            if total_size is not None:
+                total_size = int(total_size)
+            elif expected_size is not None:
+                total_size = expected_size
+            
+            bytes_downloaded = 0
+            with open(dest_path, "wb") as f:
+                while True:
+                    buffer = response.read(block_size)
+                    if not buffer:
+                        break
+                    f.write(buffer)
+                    bytes_downloaded += len(buffer)
+                    
+                    if total_size:
+                        percent = (bytes_downloaded / total_size) * 100
+                        elapsed = time.time() - start_time
+                        speed = (bytes_downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                        bar_len = 30
+                        filled_len = int(bar_len * bytes_downloaded // total_size)
+                        bar = "█" * filled_len + "░" * (bar_len - filled_len)
+                        
+                        sys.stdout.write(f"\r[{bar}] {percent:.1f}% ({speed:.1f} MB/s) - {bytes_downloaded / (1024*1024):.1f}/{total_size / (1024*1024):.1f} MB")
+                        sys.stdout.flush()
+                    else:
+                        sys.stdout.write(f"\rDownloaded {bytes_downloaded / (1024*1024):.1f} MB...")
+                        sys.stdout.flush()
+            print(f"\n{Colors.GREEN}✔ Download complete!{Colors.ENDC}")
+    except KeyboardInterrupt:
+        print(f"\n{Colors.FAIL}✘ Download cancelled.{Colors.ENDC}")
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n{Colors.FAIL}✘ Error downloading file: {e}{Colors.ENDC}")
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        sys.exit(1)
+
+def verify_sha256(filepath, expected_sha):
+    """Verifies file hash."""
+    if not expected_sha:
+        return True
+    sha256 = hashlib.sha256()
+    print("Verifying file integrity...")
+    try:
+        with open(filepath, 'rb') as f:
+            while chunk := f.read(1024 * 1024):
+                sha256.update(chunk)
+        calculated = sha256.hexdigest()
+        if calculated == expected_sha:
+            print_success("Integrity verified (SHA-256 matches).")
+            return True
+        else:
+            print_error(f"Integrity verification failed!\nExpected: {expected_sha}\nGot:      {calculated}")
+            return False
+    except Exception as e:
+        print_error(f"Error during verification: {e}")
+        return False
+
+# --- Profile Management ---
+
+def get_profiles_dir():
+    home = os.path.expanduser("~")
+    path = os.path.join(home, ".config", "rpi-flash", "profiles")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def save_profile(name, config_data):
+    pdir = get_profiles_dir()
+    filepath = os.path.join(pdir, f"{name}.json")
+    with open(filepath, "w") as f:
+        json.dump(config_data, f, indent=2)
+    print_success(f"Profile '{name}' saved to {filepath}")
+
+def load_profile(name):
+    pdir = get_profiles_dir()
+    filepath = os.path.join(pdir, f"{name}.json")
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Profile '{name}' does not exist.")
+    with open(filepath, "r") as f:
+        return json.load(f)
+
+def list_profiles():
+    pdir = get_profiles_dir()
+    files = glob.glob(os.path.join(pdir, "*.json"))
+    return [os.path.basename(f)[:-5] for f in files]
+
+def delete_profile(name):
+    pdir = get_profiles_dir()
+    filepath = os.path.join(pdir, f"{name}.json")
+    if os.path.exists(filepath):
+        os.remove(filepath)
+        print_success(f"Deleted profile '{name}'")
+    else:
+        print_error(f"Profile '{name}' not found.")
+
+# --- YAML Generation ---
+
+def generate_user_data(config):
+    ssh_keys = config.get("ssh_keys", [])
+    if ssh_keys:
+        ssh_keys_str = "\n".join(f"      - {key}" for key in ssh_keys)
+    else:
+        ssh_keys_str = "      []"
+        
+    return f"""#cloud-config
+hostname: {config.get('hostname', 'raspberrypi')}
+manage_etc_hosts: true
+timezone: {config.get('timezone', 'America/Los_Angeles')}
+
+users:
+  - name: {config.get('username', 'pi')}
+    groups: users,adm,dialout,audio,netdev,video,plugdev,cdrom,games,input,gpio,spi,i2c,render,sudo
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: {config.get('password_hash', '')}
+    ssh_authorized_keys:
+{ssh_keys_str}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+
+rpi:
+    spi: {str(config.get('enable_spi', False)).lower()}
+    i2c: {str(config.get('enable_i2c', False)).lower()}
+    serial: {str(config.get('enable_serial', False)).lower()}
+    onewire: {str(config.get('enable_onewire', False)).lower()}
+    enable_usb_gadget: {str(config.get('enable_usb_gadget', False)).lower()}
+
+enable_ssh: {str(config.get('enable_ssh', True)).lower()}
+ssh_pwauth: {str(config.get('ssh_pwauth', True)).lower()}
+"""
+
+def generate_network_config(config):
+    if not config.get("wifi_ssid"):
+        return None
+    return f"""network:
+  version: 2
+  wifis:
+    wlan0:
+      dhcp4: true
+      regulatory-domain: "{config.get('wifi_country', 'US')}"
+      access-points:
+        "{config['wifi_ssid']}":
+          password: "{config.get('wifi_pass', '')}"
+"""
+
+# --- Interactive Configuration Wizard ---
+
+def run_configuration_wizard(defaults=None):
+    if defaults is None:
+        defaults = {}
+        
+    print_header("Raspberry Pi Configuration Wizard")
+    
+    config = {}
+    config["hostname"] = prompt_text("Enter Hostname", defaults.get("hostname", "raspberrypi"))
+    config["username"] = prompt_text("Enter Default Username", defaults.get("username", "pi"))
+    
+    # Password configuration
+    if prompt_yes_no("Configure password login?", True):
+        passwd = prompt_password("Enter password for user")
+        print("Hashing password...")
+        config["password_hash"] = hash_password(passwd)
+        config["ssh_pwauth"] = True
+    else:
+        config["password_hash"] = ""
+        config["ssh_pwauth"] = False
+        print("Password login disabled. Note: SSH public key will be required to log in.")
+        
+    # SSH keys configuration
+    config["ssh_keys"] = []
+    if prompt_yes_no("Configure SSH public keys?", True):
+        local_keys = get_local_ssh_keys()
+        options = ["No SSH keys"]
+        if local_keys:
+            options.append(f"Use a local SSH key (found {len(local_keys)} keys)")
+        options.extend(["Fetch keys from GitHub username", "Paste custom SSH public key"])
+        
+        choice = prompt_choice("How would you like to add SSH keys?", options)
+        
+        # Local keys
+        if "local" in options[choice-1].lower():
+            key_choices = [f"{name} ({content[:30]}...)" for name, content in local_keys]
+            key_choice = prompt_choice("Select local SSH key:", key_choices)
+            config["ssh_keys"].append(local_keys[key_choice-1][1])
+        # Github keys
+        elif "github" in options[choice-1].lower():
+            gh_user = prompt_text("Enter GitHub username")
+            try:
+                keys = get_github_ssh_keys(gh_user)
+                if keys:
+                    config["ssh_keys"].extend(keys)
+                    print_success(f"Added {len(keys)} keys from GitHub user '{gh_user}'")
+                else:
+                    print_warning(f"No public keys found for GitHub user '{gh_user}'")
+            except Exception as e:
+                print_error(str(e))
+        # Custom key
+        elif "paste" in options[choice-1].lower():
+            key_str = prompt_text("Paste SSH public key (starts with ssh-rsa, ssh-ed25519, etc.)")
+            if key_str:
+                config["ssh_keys"].append(key_str)
+                
+    config["enable_ssh"] = True # Enabled by default for cloud-init headless config
+    
+    # Wi-Fi configuration
+    if prompt_yes_no("Configure Wi-Fi settings?", True):
+        config["wifi_ssid"] = prompt_text("Enter Wi-Fi SSID", defaults.get("wifi_ssid", ""))
+        config["wifi_pass"] = prompt_text("Enter Wi-Fi Password", defaults.get("wifi_pass", ""))
+        config["wifi_country"] = prompt_text("Enter Wi-Fi Country Code (2 letters)", defaults.get("wifi_country", "US")).upper()
+    else:
+        config["wifi_ssid"] = ""
+        config["wifi_pass"] = ""
+        config["wifi_country"] = "US"
+        
+    # Interfaces configuration
+    print_header("Hardware Interfaces Configuration")
+    config["enable_i2c"] = prompt_yes_no("Enable I2C?", defaults.get("enable_i2c", False))
+    config["enable_spi"] = prompt_yes_no("Enable SPI?", defaults.get("enable_spi", False))
+    config["enable_serial"] = prompt_yes_no("Enable Serial Console?", defaults.get("enable_serial", False))
+    config["enable_onewire"] = prompt_yes_no("Enable 1-Wire?", defaults.get("enable_onewire", False))
+    config["enable_usb_gadget"] = prompt_yes_no("Enable USB Gadget Mode?", defaults.get("enable_usb_gadget", False))
+    config["timezone"] = defaults.get("timezone", "America/Los_Angeles")
+    
+    return config
+
+# --- Main Entry and Subcommands ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="rpi-flash: Customizable and safe Raspberry Pi image flasher wrapper around rpi-imager",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Flash interactively
+  rpi-flash flash /dev/sdb
+  
+  # Flash using a specific local image and saved profile
+  rpi-flash flash /dev/sdb --image 2026-04-21-raspios-trixie-arm64.img.xz --profile homelab
+  
+  # Create a configuration profile interactively without flashing
+  rpi-flash profile create homelab
+  
+  # List all available official OS images from the Raspberry Pi mirror
+  rpi-flash list-images
+"""
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Subcommand to run")
+
+    # flash command
+    flash_parser = subparsers.add_parser("flash", help="Flash an image to a target device")
+    flash_parser.add_argument("device", nargs="?", help="Target block device (e.g. /dev/sdb)")
+    flash_parser.add_argument("-i", "--image", help="Local image file path, official OS name keyword, or URL to download")
+    flash_parser.add_argument("-p", "--profile", help="Name of a saved configuration profile to load defaults from")
+    flash_parser.add_argument("--hostname", help="Hostname for the Pi")
+    flash_parser.add_argument("--username", help="Default username")
+    flash_parser.add_argument("--password", help="Plaintext password (will be hashed)")
+    flash_parser.add_argument("--ssh-key", action="append", dest="ssh_keys", help="SSH public key string (can be specified multiple times)")
+    flash_parser.add_argument("--github-keys", help="Fetch SSH keys from a GitHub username")
+    flash_parser.add_argument("--wifi-ssid", help="Wi-Fi network SSID")
+    flash_parser.add_argument("--wifi-pass", help="Wi-Fi network password")
+    flash_parser.add_argument("--wifi-country", help="Wi-Fi country code (e.g. US)")
+    flash_parser.add_argument("--enable-i2c", action="store_true", default=None, help="Enable I2C interface")
+    flash_parser.add_argument("--enable-spi", action="store_true", default=None, help="Enable SPI interface")
+    flash_parser.add_argument("--enable-serial", action="store_true", default=None, help="Enable Serial console")
+    flash_parser.add_argument("--enable-onewire", action="store_true", default=None, help="Enable 1-Wire interface")
+    flash_parser.add_argument("--enable-usb-gadget", action="store_true", default=None, help="Enable USB gadget mode")
+    flash_parser.add_argument("--non-interactive", action="store_true", help="Do not prompt; run fully automated (fails if inputs are incomplete)")
+
+    # profile command
+    profile_parser = subparsers.add_parser("profile", help="Manage saved configuration profiles")
+    profile_subparsers = profile_parser.add_subparsers(dest="profile_action", required=True, help="Profile action")
+    
+    profile_list_parser = profile_subparsers.add_parser("list", help="List all saved profiles")
+    
+    profile_del_parser = profile_subparsers.add_parser("delete", help="Delete a saved profile")
+    profile_del_parser.add_argument("profile_name", help="Name of the profile to delete")
+    
+    profile_show_parser = profile_subparsers.add_parser("show", help="Show details of a profile")
+    profile_show_parser.add_argument("profile_name", help="Name of the profile to show")
+    
+    profile_create_parser = profile_subparsers.add_parser("create", help="Create a profile interactively")
+    profile_create_parser.add_argument("profile_name", help="Name of the new profile")
+
+    # list-images command
+    list_images_parser = subparsers.add_parser("list-images", help="List available official Raspberry Pi OS images")
+
+    # download command
+    download_parser = subparsers.add_parser("download", help="Download an official OS image to local cache")
+    download_parser.add_argument("image", help="Official OS name keyword or URL to download")
+
+    args = parser.parse_args()
+
+    # Verify rpi-imager is installed
+    rpi_imager_path = shutil.which("rpi-imager")
+    if not rpi_imager_path:
+        print_error("rpi-imager command was not found in your PATH. Please install it first.")
+        sys.exit(1)
+
+    # Dispatch commands
+    if args.command == "profile":
+        handle_profile_command(args)
+    elif args.command == "list-images":
+        handle_list_images()
+    elif args.command == "download":
+        handle_download_command(args)
+    elif args.command == "flash":
+        handle_flash_command(args)
+
+# --- Subcommand Handlers ---
+
+def handle_profile_command(args):
+    if args.profile_action == "list":
+        profiles = list_profiles()
+        print_header("Saved Configuration Profiles")
+        if not profiles:
+            print("No profiles found. Use 'rpi-flash profile create <name>' to create one.")
+        else:
+            for p in profiles:
+                print(f"  - {Colors.GREEN}{p}{Colors.ENDC}")
+    elif args.profile_action == "delete":
+        delete_profile(args.profile_name)
+    elif args.profile_action == "show":
+        try:
+            config = load_profile(args.profile_name)
+            print_header(f"Profile: {args.profile_name}")
+            # Mask sensitive info
+            masked_config = config.copy()
+            if masked_config.get("password_hash"):
+                masked_config["password_hash"] = "[MASKED HASH]"
+            if masked_config.get("wifi_pass"):
+                masked_config["wifi_pass"] = "[MASKED PASSWORD]"
+            print(json.dumps(masked_config, indent=2))
+        except FileNotFoundError as e:
+            print_error(str(e))
+    elif args.profile_action == "create":
+        config = run_configuration_wizard()
+        save_profile(args.profile_name, config)
+
+def handle_list_images():
+    catalog = fetch_official_os_list()
+    flat_images = flatten_os_list(catalog.get("os_list", []))
+    print_header("Official Raspberry Pi OS Catalog")
+    
+    # Group by category
+    categories = {}
+    for img in flat_images:
+        cat = img["full_category"] or "Other"
+        if cat not in categories:
+            categories[cat] = []
+        categories[cat].append(img)
+        
+    for cat, imgs in categories.items():
+        print(f"\n{Colors.BOLD}{Colors.BLUE}[ {cat} ]{Colors.ENDC}")
+        for img in imgs:
+            print(f"  {Colors.GREEN}{img['name']}{Colors.ENDC}")
+            if img.get("description"):
+                print(f"    Desc: {img['description']}")
+            print(f"    Size: {img.get('image_download_size', 0) / (1024*1024):.1f} MB (compressed)")
+
+def resolve_image(image_spec):
+    """Resolves image spec (path, keyword, URL) to local file path."""
+    if not image_spec:
+        return None
+        
+    # Case 1: Local file
+    if os.path.exists(image_spec) and os.path.isfile(image_spec):
+        return os.path.abspath(image_spec)
+        
+    # Case 2: URL
+    if image_spec.startswith("http://") or image_spec.startswith("https://"):
+        filename = image_spec.split("/")[-1]
+        home = os.path.expanduser("~")
+        dest_path = os.path.join(home, ".cache", "rpi-flash", filename)
+        
+        # Simple download check
+        if os.path.exists(dest_path):
+            print_success(f"Using cached image: {dest_path}")
+            return dest_path
+            
+        download_file(image_spec, dest_path)
+        return dest_path
+        
+    # Case 3: Keyword in catalog
+    catalog = fetch_official_os_list()
+    flat_images = flatten_os_list(catalog.get("os_list", []))
+    
+    # Direct exact or partial match
+    matched = None
+    matches = []
+    for img in flat_images:
+        if img["name"].lower() == image_spec.lower():
+            matched = img
+            break
+        if image_spec.lower() in img["name"].lower():
+            matches.append(img)
+            
+    if not matched:
+        if not matches:
+            print_error(f"Image specifier '{image_spec}' is not a local file, valid URL, or known OS catalog name.")
+            sys.exit(1)
+        elif len(matches) == 1:
+            matched = matches[0]
+        else:
+            print_warning(f"Multiple matches found in OS catalog for '{image_spec}':")
+            for idx, m in enumerate(matches, 1):
+                print(f"  {idx}) {m['name']}")
+            print("Please specify a more exact image name.")
+            sys.exit(1)
+            
+    # Found catalog image, now download/use cached
+    filename = matched["url"].split("/")[-1]
+    home = os.path.expanduser("~")
+    dest_path = os.path.join(home, ".cache", "rpi-flash", filename)
+    
+    if os.path.exists(dest_path):
+        # Verify size if matched has size info
+        cached_size = os.path.getsize(dest_path)
+        expected_size = matched.get("image_download_size")
+        if expected_size is None or cached_size == expected_size:
+            print_success(f"Using cached catalog image: {dest_path}")
+            return dest_path
+        else:
+            print_warning(f"Cached image size mismatch (cached: {cached_size}, expected: {expected_size}). Re-downloading.")
+            
+    download_file(matched["url"], dest_path, matched.get("image_download_size"))
+    verify_sha256(dest_path, matched.get("extract_sha256"))
+    return dest_path
+
+def handle_download_command(args):
+    path = resolve_image(args.image)
+    if path:
+        print_success(f"Image ready at: {path}")
+
+def handle_flash_command(args):
+    # Determine the target device
+    device = args.device
+    devices = get_removable_disks()
+    
+    if not device:
+        if args.non_interactive:
+            print_error("No target device specified in non-interactive mode.")
+            sys.exit(1)
+            
+        print_header("Disk Selection")
+        if not devices:
+            print_warning("No removable USB/SD devices detected automatically.")
+            device_input = prompt_text("Enter device path manually (e.g. /dev/sdb)")
+            if not device_input:
+                sys.exit(1)
+            device = device_input
+        else:
+            options = [f"{d['path']} - {d['model']} ({d['size']}, {d['tran']})" for d in devices]
+            choice = prompt_choice("Select target device:", options)
+            device = devices[choice-1]["path"]
+    else:
+        # Check if specified device is valid/removable
+        matching_dev = next((d for d in devices if d["path"] == device or d["name"] == device), None)
+        if not matching_dev:
+            print_warning(f"{device} was not detected as a removable drive.")
+            if not args.non_interactive:
+                if not prompt_yes_no(f"Are you sure you want to write to {device}?", False):
+                    sys.exit(1)
+        else:
+            device = matching_dev["path"]
+
+    # Verify device exists
+    if not os.path.exists(device):
+        print_error(f"Device path {device} does not exist.")
+        sys.exit(1)
+
+    # Setup configurations: start with loaded profile, then CLI overrides, then interactive wizard
+    config = {}
+    if args.profile:
+        try:
+            config = load_profile(args.profile)
+            print_success(f"Loaded defaults from profile '{args.profile}'")
+        except FileNotFoundError as e:
+            print_error(str(e))
+            sys.exit(1)
+    elif not args.non_interactive:
+        # Prompt if there are saved profiles available
+        profiles = list_profiles()
+        if profiles:
+            if prompt_yes_no("Would you like to load defaults from a saved profile?", True):
+                options = [p for p in profiles]
+                options.append("Configure from scratch")
+                choice = prompt_choice("Select profile:", options)
+                if choice <= len(profiles):
+                    selected_profile = profiles[choice-1]
+                    try:
+                        config = load_profile(selected_profile)
+                        print_success(f"Loaded defaults from profile '{selected_profile}'")
+                    except Exception as e:
+                        print_error(f"Error loading profile: {e}")
+
+    # Apply CLI args on top of profile
+    if args.hostname: config["hostname"] = args.hostname
+    if args.username: config["username"] = args.username
+    if args.password: 
+        print("Hashing password from arguments...")
+        config["password_hash"] = hash_password(args.password)
+        config["ssh_pwauth"] = True
+    if args.ssh_keys:
+        if "ssh_keys" not in config:
+            config["ssh_keys"] = []
+        config["ssh_keys"].extend(args.ssh_keys)
+    if args.github_keys:
+        try:
+            keys = get_github_ssh_keys(args.github_keys)
+            if "ssh_keys" not in config:
+                config["ssh_keys"] = []
+            config["ssh_keys"].extend(keys)
+            print_success(f"Added keys from GitHub user '{args.github_keys}'")
+        except Exception as e:
+            print_error(str(e))
+            if args.non_interactive:
+                sys.exit(1)
+                
+    if args.wifi_ssid: config["wifi_ssid"] = args.wifi_ssid
+    if args.wifi_pass: config["wifi_pass"] = args.wifi_pass
+    if args.wifi_country: config["wifi_country"] = args.wifi_country
+    
+    if args.enable_i2c is not None: config["enable_i2c"] = args.enable_i2c
+    if args.enable_spi is not None: config["enable_spi"] = args.enable_spi
+    if args.enable_serial is not None: config["enable_serial"] = args.enable_serial
+    if args.enable_onewire is not None: config["enable_onewire"] = args.enable_onewire
+    if args.enable_usb_gadget is not None: config["enable_usb_gadget"] = args.enable_usb_gadget
+
+    # Fill in missing fields interactively if not in non-interactive mode
+    if not args.non_interactive:
+        # Check if we should prompt
+        if not config or (not config.get("hostname") or not config.get("username")):
+            config = run_configuration_wizard(config)
+            
+            # Ask if they want to save profile
+            if prompt_yes_no("Save these settings as a profile for future use?", False):
+                pname = prompt_text("Enter profile name")
+                if pname:
+                    save_profile(pname, config)
+    else:
+        # Check defaults for required fields in non-interactive mode
+        config.setdefault("hostname", "raspberrypi")
+        config.setdefault("username", "pi")
+        config.setdefault("enable_ssh", True)
+        config.setdefault("ssh_pwauth", True if config.get("password_hash") else False)
+
+    # Resolve image
+    image_path = args.image
+    if not image_path:
+        if args.non_interactive:
+            # Fallback to recommended image
+            print_warning("No image specified. Defaulting to recommended 64-bit OS.")
+            image_path = "Raspberry Pi OS (64-bit)"
+        else:
+            catalog = fetch_official_os_list()
+            # Find the top 3 recommended images
+            recommended = []
+            for img in flatten_os_list(catalog.get("os_list", [])):
+                if "Recommended" in img.get("description", "") or "Raspberry Pi OS" in img.get("name", ""):
+                    recommended.append(img)
+            
+            # Show a list to choose from
+            rec_options = [f"{r['name']} - {r['description'][:50]}..." for r in recommended[:4]]
+            rec_options.append("Enter custom local path or URL")
+            
+            choice = prompt_choice("Select OS image to flash:", rec_options)
+            if choice <= len(recommended[:4]):
+                image_path = recommended[choice-1]["name"]
+            else:
+                image_path = prompt_text("Enter path to local file or download URL")
+                if not image_path:
+                    print_error("No image specified.")
+                    sys.exit(1)
+
+    image_local_path = resolve_image(image_path)
+    if not image_local_path or not os.path.exists(image_local_path):
+        print_error("Failed to resolve a local image path for flashing.")
+        sys.exit(1)
+
+    # Unmount partitions if they are mounted
+    dev_name = os.path.basename(device)
+    devices_info = get_removable_disks()
+    target_info = next((d for d in devices_info if d["path"] == device), None)
+    if target_info and target_info["mounts"]:
+        print_warning(f"Partitions of device {device} are currently mounted:")
+        for m in target_info["mounts"]:
+            print(f"  Mounted at: {m}")
+        if not args.non_interactive:
+            if prompt_yes_no("Attempt to unmount partitions?", True):
+                for m in target_info["mounts"]:
+                    print(f"Unmounting {m}...")
+                    subprocess.run(["sudo", "umount", m])
+        else:
+            for m in target_info["mounts"]:
+                print(f"Unmounting {m}...")
+                subprocess.run(["sudo", "umount", m])
+
+    # Final Warning before flashing
+    print_header("FINAL CONFIRMATION")
+    print(f"{Colors.BOLD}{Colors.FAIL}WARNING: This will DESTROY all data on {device}!{Colors.ENDC}")
+    print(f"Target Device:  {device}")
+    print(f"OS Image:       {image_local_path}")
+    print(f"Hostname:       {config.get('hostname')}")
+    print(f"Username:       {config.get('username')}")
+    if config.get("wifi_ssid"):
+        print(f"Wi-Fi SSID:     {config.get('wifi_ssid')}")
+    else:
+        print("Wi-Fi SSID:     Not configured")
+        
+    if not args.non_interactive:
+        confirm = input(f"\nType {Colors.BOLD}{Colors.FAIL}yes{Colors.ENDC} to confirm and start writing: ").strip()
+        if confirm != "yes":
+            print_warning("Flash cancelled by user.")
+            sys.exit(0)
+    else:
+        print("Non-interactive mode: proceeding with flash...")
+
+    # Write configs to temporary files
+    user_data_yaml = generate_user_data(config)
+    network_config_yaml = generate_network_config(config)
+
+    # Use NamedTemporaryFile to avoid security races
+    with tempfile.NamedTemporaryFile(mode='w', suffix='-user-data.yaml', delete=False) as f_ud:
+        f_ud.write(user_data_yaml)
+        temp_ud_path = f_ud.name
+
+    temp_nc_path = None
+    if network_config_yaml:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='-network-config.yaml', delete=False) as f_nc:
+            f_nc.write(network_config_yaml)
+            temp_nc_path = f_nc.name
+
+    try:
+        # Construct rpi-imager CLI command
+        cmd = ["sudo", "rpi-imager", "--cli", "--cloudinit-userdata", temp_ud_path]
+        if temp_nc_path:
+            cmd.extend(["--cloudinit-networkconfig", temp_nc_path])
+        cmd.extend([image_local_path, device])
+        
+        print_header("FLASHING IMAGE")
+        print(f"{Colors.BLUE}Executing: {' '.join(cmd)}{Colors.ENDC}\n")
+        
+        proc = subprocess.run(cmd)
+        if proc.returncode == 0:
+            print_success(f"Raspberry Pi OS successfully written to {device}!")
+            print("You can now safely eject the device and boot your Raspberry Pi.")
+        else:
+            print_error(f"Flashing failed with exit code: {proc.returncode}")
+            sys.exit(proc.returncode)
+    finally:
+        # Secure cleanup
+        if os.path.exists(temp_ud_path):
+            os.remove(temp_ud_path)
+        if temp_nc_path and os.path.exists(temp_nc_path):
+            os.remove(temp_nc_path)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Colors.FAIL}✘ Process interrupted by user.{Colors.ENDC}")
+        sys.exit(1)
